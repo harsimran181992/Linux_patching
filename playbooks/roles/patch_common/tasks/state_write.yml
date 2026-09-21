@@ -1,0 +1,19 @@
+---
+# Parameterized include. Caller must set:
+#   state_filename : e.g. "precheck.json"
+#   state_data     : the dict to serialize
+- name: Assert state_write parameters are set
+  ansible.builtin.assert:
+    that:
+      - state_filename is defined
+      - state_data is defined
+    fail_msg: "state_write.yml requires state_filename and state_data vars."
+    quiet: true
+
+- name: "Write the state file for this change: {{ state_filename }}"
+  ansible.builtin.copy:
+    dest: "{{ patch_state_root }}/{{ change_id }}/{{ state_filename }}"
+    content: "{{ state_data | to_nice_json }}"
+    mode: "{{ patch_state_file_mode }}"
+    owner: root
+    group: root

@@ -1,0 +1,4 @@
+---
+# Below this many seconds of uptime, a host that reported a performed
+# reboot is considered to have actually rebooted (sanity check).
+patch_reboot_uptime_sanity_seconds: 3600

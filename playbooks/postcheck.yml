@@ -1,0 +1,78 @@
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# Playbook : postcheck.yml
+# Purpose  : RHEL 8/9 post-patch post-check. Reads back precheck.json and
+#            patch_summary.json written by the earlier, independently-run
+#            playbooks, collects a fresh snapshot and writes it as
+#            postcheck.json (same shape as precheck.json, no comparison
+#            data), then compares the two (static items must match --
+#            full checklist, not just mismatches; changed items validate
+#            the patch/reboot actually took effect) and writes that result
+#            separately as comparison.json. Then aggregates every host's
+#            result into one run-level summary and pushes it to ServiceNow
+#            (patch_snow_notify -- stub until your SNOW instance details
+#            are filled in, see playbooks/roles/patch_snow_notify/README.md).
+#
+# Trigger  : Launched by ServiceNow at the patch-window-end stage.
+#
+# extra_vars contract (required on every launch):
+#   change_id: "CHG0012345"
+#   target_hosts:
+#     - {hostname: "web01.example.com", ip: "10.1.2.3"}
+#
+# Standalone usage:
+#   ansible-playbook playbooks/postcheck.yml \
+#     -e change_id=CHG0012345 \
+#     -e '{"target_hosts":[{"hostname":"web01.example.com","ip":"10.1.2.3"}]}'
+# ─────────────────────────────────────────────────────────────────────────────
+
+- name: Bootstrap dynamic targets from the ServiceNow host list
+  hosts: localhost
+  gather_facts: false
+  connection: local
+  tasks:
+    - name: Turn extra_vars.target_hosts into the dynamic_targets inventory group
+      ansible.builtin.include_role:
+        name: patch_common
+        tasks_from: bootstrap_targets
+
+- name: Run post-check against every target host
+  hosts: dynamic_targets
+  become: true
+  gather_facts: true
+  # See precheck.yml for why these reference hostvars['localhost'] rather
+  # than a bare "{{ var }}" (max_fail_percentage fails to template directly
+  # against a runtime-created group -- reproduced against ansible-core 2.19).
+  serial: "{{ hostvars['localhost'].patch_batch_serial }}"
+  max_fail_percentage: "{{ hostvars['localhost'].patch_max_fail_percentage }}"
+  any_errors_fatal: false
+  tasks:
+    - name: Detect OS and load per-version group_vars (RHEL 8/9 gate)
+      ansible.builtin.include_role:
+        name: patch_common
+        tasks_from: assign_os_group
+
+    - name: Ensure the per-change state directory exists
+      ansible.builtin.include_role:
+        name: patch_common
+        tasks_from: ensure_state_dir
+
+    - name: Run post-check
+      ansible.builtin.include_role:
+        name: patch_postcheck
+
+- name: Aggregate results and notify ServiceNow
+  hosts: localhost
+  gather_facts: false
+  connection: local
+  tasks:
+    - name: Build the run-level summary from every target host's postcheck_summary
+      ansible.builtin.set_fact:
+        snow_payload: "{{ (snow_payload | default([])) + [hostvars[item].postcheck_summary | default({'hostname': item, 'postcheck_status': 'unknown', 'note': 'post-check role did not complete for this host'})] }}"
+      loop: "{{ groups['dynamic_targets'] }}"
+      loop_control:
+        label: "{{ item }}"
+
+    - name: Push the run-level summary to ServiceNow
+      ansible.builtin.include_role:
+        name: patch_snow_notify

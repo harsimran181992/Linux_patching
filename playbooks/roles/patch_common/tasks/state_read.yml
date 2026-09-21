@@ -1,0 +1,38 @@
+---
+# Parameterized include. Caller must set:
+#   state_filename    : e.g. "precheck.json"
+#   state_result_var  : name of the fact to populate with the parsed content
+#   state_required    : (optional, default true) fail if the file is missing
+- name: Assert state_read parameters are set
+  ansible.builtin.assert:
+    that:
+      - state_filename is defined
+      - state_result_var is defined
+    fail_msg: "state_read.yml requires state_filename and state_result_var vars."
+    quiet: true
+
+- name: "Check the state file exists for this change: {{ state_filename }}"
+  ansible.builtin.stat:
+    path: "{{ patch_state_root }}/{{ change_id }}/{{ state_filename }}"
+  register: _state_file_stat
+
+- name: "Fail if the required state file is missing: {{ state_filename }}"
+  ansible.builtin.fail:
+    msg: >-
+      {{ patch_state_root }}/{{ change_id }}/{{ state_filename }} not found on
+      {{ inventory_hostname }} for change {{ change_id }}. Was the
+      corresponding earlier stage run for this change_id and this host?
+  when:
+    - not _state_file_stat.stat.exists
+    - state_required | default(true)
+
+- name: "Read the state file: {{ state_filename }}"
+  ansible.builtin.slurp:
+    path: "{{ patch_state_root }}/{{ change_id }}/{{ state_filename }}"
+  register: _state_file_slurp
+  when: _state_file_stat.stat.exists
+
+- name: "Parse the state file into a fact: {{ state_result_var }}"
+  ansible.builtin.set_fact:
+    "{{ state_result_var }}": "{{ _state_file_slurp.content | b64decode | from_json }}"
+  when: _state_file_stat.stat.exists

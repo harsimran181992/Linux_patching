@@ -1,0 +1,21 @@
+---
+# Runs on each dynamic_targets host, after facts are gathered. Gates the
+# run to RHEL 8/9 only, then uses the core group_by module (verified via
+# `ansible-doc ansible.builtin.group_by`) to place the host into an
+# `rhel8`/`rhel9` group so playbooks/group_vars/rhel8.yml or rhel9.yml apply for the
+# rest of this run -- the standard, documented pattern for this exact need.
+- name: Fail fast on unsupported OS (this automation supports RHEL 8/9 only)
+  ansible.builtin.assert:
+    that:
+      - ansible_facts.distribution == "RedHat"
+      - ansible_facts.distribution_major_version in ["8", "9"]
+    fail_msg: >-
+      {{ inventory_hostname }} is
+      {{ ansible_facts.distribution | default('unknown') }}
+      {{ ansible_facts.distribution_major_version | default('?') }};
+      this automation supports RHEL 8 and RHEL 9 only.
+    quiet: true
+
+- name: Place host into its OS-major-version group (loads playbooks/group_vars/rhelN.yml)
+  ansible.builtin.group_by:
+    key: "rhel{{ ansible_facts.distribution_major_version }}"

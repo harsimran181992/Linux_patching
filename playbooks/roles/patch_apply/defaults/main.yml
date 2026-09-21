@@ -1,0 +1,10 @@
+---
+patch_packages: "*"
+patch_exclude: []
+patch_security_only: false
+patch_bugfix_only: false
+reboot_policy: auto
+reboot_timeout: 900
+reboot_pre_delay: 5
+reboot_post_delay: 30
+maintenance_window: {}

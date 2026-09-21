@@ -1,0 +1,257 @@
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# patch_postcheck
+#
+# Runs once per host (called from playbooks/postcheck.yml, independently of
+# precheck.yml/patch.yml -- possibly hours/days later). Reads back
+# precheck.json + patch_summary.json written by the earlier stages on this
+# same host, collects a fresh snapshot, and produces TWO separate files:
+#
+#   postcheck.json   -- the raw post-patch snapshot, same shape as
+#                        precheck.json, no comparison data. Written first,
+#                        immediately after collection -- a pure artifact of
+#                        "what does this host look like right now", reusable
+#                        on its own regardless of how the comparison logic
+#                        evolves later.
+#   comparison.json   -- the actual diff: every static component with a
+#                        matched: true/false verdict (a full checklist, not
+#                        just the mismatches), plus the changed-item
+#                        validation (kernel/reboot/package summary) and the
+#                        overall status.
+#
+# Sets `postcheck_summary` (a compact per-host dict) at the end -- the
+# playbook's final aggregation play reads this via hostvars to build one
+# run-level ServiceNow update instead of one call per host.
+# ─────────────────────────────────────────────────────────────────────────────
+
+- name: Run and record post-check for this host
+  block:
+
+    - name: Read precheck.json
+      ansible.builtin.include_role:
+        name: patch_common
+        tasks_from: state_read
+      vars:
+        state_filename: precheck.json
+        state_result_var: _precheck_data
+        state_required: true
+
+    - name: Read patch_summary.json
+      ansible.builtin.include_role:
+        name: patch_common
+        tasks_from: state_read
+      vars:
+        state_filename: patch_summary.json
+        state_result_var: _patch_summary_data
+        state_required: true
+
+    - name: Collect a fresh static/changed fact snapshot
+      ansible.builtin.include_role:
+        name: patch_facts_collect
+
+    # ── postcheck.json: the raw snapshot, written immediately, before any
+    #    comparison happens. Mirrors precheck.json's shape exactly. ─────────
+    - name: Assemble the raw post-patch snapshot
+      ansible.builtin.set_fact:
+        postcheck_snapshot: "{{ patch_collected_facts | combine({'change_id': change_id, 'stage': 'postcheck'}) }}"
+
+    - name: Write postcheck.json (raw post-patch snapshot)
+      ansible.builtin.include_role:
+        name: patch_common
+        tasks_from: state_write
+      vars:
+        state_filename: postcheck.json
+        state_data: "{{ postcheck_snapshot }}"
+
+    # ── From here on: the comparison itself, kept entirely separate from
+    #    the snapshot above. ────────────────────────────────────────────────
+    - name: Snapshot currently-failed systemd units
+      ansible.builtin.command: systemctl --failed --no-legend
+      changed_when: false
+      failed_when: false   # non-fatal here; treated as data, not a hard blocker
+      register: _failed_units_now
+
+    - name: Compute newly-failed systemd units (not present in the pre-check baseline)
+      ansible.builtin.set_fact:
+        _new_failed_units: "{{ (_failed_units_now.stdout_lines | map('trim') | list) | difference(_precheck_data.failed_systemd_units_baseline | default([])) }}"
+
+    # ── Static components: expected IDENTICAL pre vs post. Full checklist --
+    #    every component gets a matched: true/false verdict, not just the
+    #    ones that differed, so the report shows everything that was
+    #    checked, not only the failures. Each mismatch carries `field_changes`
+    #    -- a recursive, field-level diff (playbooks/roles/patch_postcheck/
+    #    filter_plugins/deep_diff.py) instead of a full pre/post dump of the
+    #    whole component, so e.g. a disk finding reads
+    #    "devices.sr0.size: 628.00 KB -> 1024.00 MB" rather than the entire
+    #    disks dict twice. ───────────────────────────────────────────────────
+    - name: Compare each static component (pre-check vs post-check) -- field-level diff, full checklist
+      ansible.builtin.set_fact:
+        _static_comparison: "{{ (_static_comparison | default([])) + [{'component': item, 'severity': ('critical' if item in patch_check_severity.critical else ('warning' if item in patch_check_severity.warning else 'informational')), 'field_changes': (_precheck_data.static[item] | patch_deep_diff(patch_collected_facts.static[item], item)), 'matched': (_precheck_data.static[item] | patch_deep_diff(patch_collected_facts.static[item], item) | length == 0)}] }}"
+      loop: "{{ patch_collected_facts.static.keys() | list }}"
+      loop_control:
+        label: "{{ item }}"
+
+    - name: Extract just the mismatched components (drives status + the ServiceNow summary)
+      ansible.builtin.set_fact:
+        _static_mismatches: "{{ _static_comparison | selectattr('matched', 'equalto', false) | list }}"
+
+    - name: Build a human-readable summary of critical field changes (for the failure message)
+      ansible.builtin.set_fact:
+        _critical_summary: "{{ (_critical_summary | default([])) + [item.component ~ ' (' ~ (item.field_changes | map(attribute='path') | join(', ')) ~ ')'] }}"
+      loop: "{{ _static_mismatches | selectattr('severity', 'equalto', 'critical') | list }}"
+      loop_control:
+        label: "{{ item.component }}"
+
+    # ── Changed components: expected TO DIFFER, used to validate patching
+    #    actually took effect rather than to flag drift. ─────────────────────
+    - name: Sanity-check the reboot, if one was recorded as performed
+      ansible.builtin.set_fact:
+        _reboot_sanity_ok: "{{ (patch_collected_facts.changed.uptime_seconds | int) < (patch_reboot_uptime_sanity_seconds | int) }}"
+      when: _patch_summary_data.reboot_performed | default(false)
+
+    - name: Flag if a performed reboot didn't actually result in low uptime
+      ansible.builtin.set_fact:
+        _reboot_anomaly: "{{ (_patch_summary_data.reboot_performed | default(false)) and not (_reboot_sanity_ok | default(true)) }}"
+
+    # ── Did patching actually change anything? uptime_seconds is expected to
+    #    differ on essentially every run (time passes, or a reboot resets
+    #    it) regardless of whether any package was actually touched, so it
+    #    can't be used on its own as evidence patching happened. Compare
+    #    every OTHER changed-category field (kernel, os_version, packages)
+    #    with the same field-level deep_diff used for the static comparison:
+    #    if none of those differ, uptime is the ONLY thing that changed,
+    #    which means dnf didn't actually apply anything this cycle. ─────────
+    - name: Compare changed-category fields other than uptime (did patching actually change anything?)
+      ansible.builtin.set_fact:
+        _changed_field_diffs: "{{ {'kernel': _precheck_data.changed.kernel, 'os_version': _precheck_data.changed.os_version, 'packages': _precheck_data.changed.packages} | patch_deep_diff({'kernel': patch_collected_facts.changed.kernel, 'os_version': patch_collected_facts.changed.os_version, 'packages': patch_collected_facts.changed.packages}, 'changed') }}"
+
+    - name: Flag if nothing actually changed besides uptime (patching had no real effect)
+      ansible.builtin.set_fact:
+        _no_real_patch_change: "{{ _changed_field_diffs | length == 0 }}"
+
+    - name: Build the changed-item validation summary
+      ansible.builtin.set_fact:
+        _changed_validation:
+          kernel_before: "{{ _precheck_data.changed.kernel }}"
+          kernel_after: "{{ patch_collected_facts.changed.kernel }}"
+          kernel_changed: "{{ _precheck_data.changed.kernel != patch_collected_facts.changed.kernel }}"
+          os_version_before: "{{ _precheck_data.changed.os_version }}"
+          os_version_after: "{{ patch_collected_facts.changed.os_version }}"
+          uptime_seconds_after: "{{ patch_collected_facts.changed.uptime_seconds }}"
+          reboot_required: "{{ _patch_summary_data.reboot_required | default(false) }}"
+          reboot_performed: "{{ _patch_summary_data.reboot_performed | default(false) }}"
+          reboot_deferred_reason: "{{ _patch_summary_data.reboot_deferred_reason | default('') }}"
+          reboot_sanity_ok: "{{ _reboot_sanity_ok | default(omit) }}"
+          packages_changed: "{{ _patch_summary_data.packages_changed | default([]) }}"
+          changed_fields: "{{ _changed_field_diffs }}"
+          patch_had_real_effect: "{{ not _no_real_patch_change }}"
+
+    # ── Overall status ───────────────────────────────────────────────────────
+    - name: Determine overall post-check status
+      ansible.builtin.set_fact:
+        _postcheck_status: >-
+          {{
+            'failed'
+            if (_static_mismatches | selectattr('severity', 'equalto', 'critical') | list | length > 0) or _reboot_anomaly or _no_real_patch_change
+            else (
+              'success_with_warnings'
+              if (_static_mismatches | length > 0) or (_new_failed_units | length > 0)
+              else 'success'
+            )
+          }}
+
+    # ── comparison.json: the diff result, entirely separate from the raw
+    #    snapshot written above. ────────────────────────────────────────────
+    - name: Assemble comparison_data
+      ansible.builtin.set_fact:
+        comparison_data:
+          change_id: "{{ change_id }}"
+          stage: comparison
+          compared_at: "{{ ansible_date_time.iso8601 }}"
+          status: "{{ _postcheck_status }}"
+          static_comparison: "{{ _static_comparison }}"
+          changed_validation: "{{ _changed_validation }}"
+          new_failed_systemd_units: "{{ _new_failed_units }}"
+
+    - name: Write comparison.json
+      ansible.builtin.include_role:
+        name: patch_common
+        tasks_from: state_write
+      vars:
+        state_filename: comparison.json
+        state_data: "{{ comparison_data }}"
+
+    - name: Set the compact per-host summary used for ServiceNow aggregation
+      ansible.builtin.set_fact:
+        postcheck_summary:
+          hostname: "{{ inventory_hostname }}"
+          precheck_status: "{{ _precheck_data.status | default('unknown') }}"
+          patch_status: "{{ _patch_summary_data.status | default('unknown') }}"
+          postcheck_status: "{{ _postcheck_status }}"
+          kernel_before: "{{ _changed_validation.kernel_before }}"
+          kernel_after: "{{ _changed_validation.kernel_after }}"
+          reboot_required: "{{ _changed_validation.reboot_required }}"
+          reboot_performed: "{{ _changed_validation.reboot_performed }}"
+          new_failed_units: "{{ _new_failed_units }}"
+          critical_findings: "{{ _static_mismatches | selectattr('severity', 'equalto', 'critical') | map(attribute='component') | list }}"
+          warning_findings: "{{ _static_mismatches | selectattr('severity', 'equalto', 'warning') | map(attribute='component') | list }}"
+
+  rescue:
+
+    # postcheck.json (the raw snapshot) is written early in the main block,
+    # above -- if we got far enough to have patch_collected_facts, it's
+    # already on disk by the time anything here runs. This rescue only
+    # needs to make sure comparison.json (the result) still gets recorded,
+    # even if the comparison logic itself is what failed.
+    - name: Record that post-check errored unexpectedly (best-effort)
+      ansible.builtin.set_fact:
+        comparison_data:
+          change_id: "{{ change_id }}"
+          stage: comparison
+          compared_at: "{{ ansible_date_time.iso8601 }}"
+          status: failed
+          error: "{{ ansible_failed_result.msg | default('post-check task failed') }}"
+        postcheck_summary:
+          hostname: "{{ inventory_hostname }}"
+          precheck_status: "{{ _precheck_data.status | default('unknown') }}"
+          patch_status: "{{ _patch_summary_data.status | default('unknown') }}"
+          postcheck_status: "failed"
+          error: "{{ ansible_failed_result.msg | default('post-check task failed') }}"
+
+    - name: Write comparison.json for the failed run (best-effort)
+      ansible.builtin.include_role:
+        name: patch_common
+        tasks_from: state_write
+      vars:
+        state_filename: comparison.json
+        state_data: "{{ comparison_data }}"
+      ignore_errors: true
+
+    - name: Re-raise the failure so this host is marked failed in the job summary
+      ansible.builtin.fail:
+        msg: "{{ ansible_failed_result.msg | default('Post-check failed for ' ~ inventory_hostname) }}"
+
+# Deliberately OUTSIDE the block/rescue above: comparison.json (with full
+# field_changes detail) is already written by the time this runs. Failing
+# here instead of inside the block means this expected, business-logic
+# failure doesn't get caught by the SAME rescue meant for genuine
+# unexpected errors -- which would otherwise overwrite the just-written,
+# detailed comparison.json with a bare {status: failed, error: <msg>}
+# record (reproduced locally: the rich static_comparison/field_changes
+# detail was silently lost on every critical-drift failure until this was
+# split out -- confirmed by inspecting the actual file on disk after a
+# deliberate mismatch).
+- name: Build the list of reasons this host failed post-check
+  ansible.builtin.set_fact:
+    _failure_reasons: >-
+      {{
+        ([('critical drift in ' ~ (_critical_summary | join('; ')))] if (_critical_summary | default([]) | length > 0) else [])
+        + (['reboot anomaly (performed but uptime not low)'] if (_reboot_anomaly | default(false)) else [])
+        + (['no packages/kernel/os_version actually changed -- only uptime differs, patching had no real effect'] if (_no_real_patch_change | default(false)) else [])
+      }}
+  when: _postcheck_status | default('unknown') == 'failed'
+
+- name: Fail this host if post-check found a critical regression (batch continues per max_fail_percentage)
+  ansible.builtin.fail:
+    msg: "Post-check failed for {{ inventory_hostname }}: {{ _failure_reasons | join('; ') }}"
+  when: _postcheck_status | default('unknown') == 'failed'

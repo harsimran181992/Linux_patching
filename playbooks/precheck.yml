@@ -1,0 +1,62 @@
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# Playbook : precheck.yml
+# Purpose  : RHEL 8/9 pre-patch pre-check. Gathers and records the static and
+#            changed-item baseline for each host, evaluates hard blockers
+#            (disk space, repo reachability), and writes precheck.json under
+#            /var/log/patch_mgmt/<change_id>/ on each host for patch.yml and
+#            postcheck.yml (run independently, possibly hours/days later) to
+#            read back.
+#
+# Trigger  : Launched by ServiceNow (Table API / Flow Designer REST step ->
+#            AAP job_templates/{id}/launch/) at the CAB-approval stage.
+#
+# extra_vars contract (required on every launch):
+#   change_id: "CHG0012345"        # ServiceNow Change Request/Task number
+#   target_hosts:
+#     - {hostname: "web01.example.com", ip: "10.1.2.3"}
+#     - {hostname: "web02.example.com", ip: "10.1.2.4"}
+#
+# Standalone usage:
+#   ansible-playbook playbooks/precheck.yml \
+#     -e change_id=CHG0012345 \
+#     -e '{"target_hosts":[{"hostname":"web01.example.com","ip":"10.1.2.3"}]}'
+# ─────────────────────────────────────────────────────────────────────────────
+
+- name: Bootstrap dynamic targets from the ServiceNow host list
+  hosts: localhost
+  gather_facts: false
+  connection: local
+  tasks:
+    - name: Turn extra_vars.target_hosts into the dynamic_targets inventory group
+      ansible.builtin.include_role:
+        name: patch_common
+        tasks_from: bootstrap_targets
+
+- name: Run pre-check against every target host
+  hosts: dynamic_targets
+  become: true
+  gather_facts: true
+  # Referenced via hostvars['localhost'] rather than a bare "{{ var }}":
+  # for a runtime-created group (dynamic_targets has no group_vars of its
+  # own until group_by runs inside the play), max_fail_percentage fails
+  # with "'...' is undefined" when templated directly -- reproduced against
+  # ansible-core 2.19. localhost is a real, statically-known inventory host
+  # so playbooks/group_vars/all.yml is reliably merged there at parse time.
+  serial: "{{ hostvars['localhost'].patch_batch_serial }}"
+  max_fail_percentage: "{{ hostvars['localhost'].patch_max_fail_percentage }}"
+  any_errors_fatal: false
+  tasks:
+    - name: Detect OS and load per-version group_vars (RHEL 8/9 gate)
+      ansible.builtin.include_role:
+        name: patch_common
+        tasks_from: assign_os_group
+
+    - name: Ensure the per-change state directory exists
+      ansible.builtin.include_role:
+        name: patch_common
+        tasks_from: ensure_state_dir
+
+    - name: Run pre-check
+      ansible.builtin.include_role:
+        name: patch_precheck

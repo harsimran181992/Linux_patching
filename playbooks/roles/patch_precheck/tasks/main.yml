@@ -1,0 +1,139 @@
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# patch_precheck
+#
+# Runs once per host (called from playbooks/precheck.yml, already inside a
+# `serial` batch on the dynamic_targets play). Wrapped in block/rescue so a
+# failing host is isolated -- it still gets a precheck.json recording the
+# failure, and the rest of the batch continues (serial + max_fail_percentage
+# at the play level keeps the batch going; this block/rescue is what lets a
+# per-host failure not abort that host's own remaining tasks uncleanly).
+# ─────────────────────────────────────────────────────────────────────────────
+
+- name: Run and record pre-check for this host
+  block:
+
+    - name: Collect the full static/changed fact snapshot
+      ansible.builtin.include_role:
+        name: patch_facts_collect
+
+    - name: Locate the root filesystem mount entry
+      ansible.builtin.set_fact:
+        _root_mount: "{{ ansible_facts.mounts | selectattr('mount', 'equalto', '/') | list | first | default({}) }}"
+
+    - name: Locate the /boot mount entry (may not exist as a separate mount)
+      ansible.builtin.set_fact:
+        _boot_mount: "{{ ansible_facts.mounts | selectattr('mount', 'equalto', '/boot') | list | first | default({}) }}"
+
+    - name: Locate the /var mount entry (may not exist as a separate mount)
+      ansible.builtin.set_fact:
+        _var_mount: "{{ ansible_facts.mounts | selectattr('mount', 'equalto', '/var') | list | first | default({}) }}"
+
+    # ansible_facts.mounts size_available/size_total are raw bytes
+    # (statvfs f_frsize * f_bavail / f_blocks -- verified against
+    # ansible/module_utils/facts/utils.py), hence the *1024*1024 conversion.
+    - name: Evaluate disk space thresholds
+      ansible.builtin.set_fact:
+        _disk_findings: "{{ _disk_findings | default([]) + [item.label ~ ' has ' ~ ((item.mount.size_available | default(0) | int) // (1024*1024)) ~ 'MB free, below the ' ~ item.min_mb ~ 'MB threshold'] }}"
+      loop:
+        - {label: "/", mount: "{{ _root_mount }}", min_mb: "{{ min_free_space_mb.root }}"}
+        - {label: "/boot", mount: "{{ _boot_mount }}", min_mb: "{{ min_free_space_mb.boot }}"}
+        - {label: "/var", mount: "{{ _var_mount }}", min_mb: "{{ min_free_space_mb.var }}"}
+      when:
+        - item.mount.size_available is defined
+        - (item.mount.size_available | int) < ((item.min_mb | int) * 1024 * 1024)
+      loop_control:
+        label: "{{ item.label }}"
+
+    - name: Check package-manager/repo reachability (dnf check-update, dry run)
+      ansible.builtin.command: dnf check-update
+      changed_when: false
+      # dnf check-update exit codes (confirmed against dnf.readthedocs.io):
+      #   0   = no updates available
+      #   100 = updates available (the normal/expected case)
+      #   1   = a real error (repo unreachable, metadata broken, etc.)
+      failed_when: _check_update.rc not in [0, 100]
+      register: _check_update
+
+    - name: Check subscription-manager status (informational until patch_source is finalized)
+      ansible.builtin.command: subscription-manager status
+      changed_when: false
+      failed_when: false
+      register: _sub_status
+
+    - name: Snapshot currently-failed systemd units (baseline for post-check comparison)
+      ansible.builtin.command: systemctl --failed --no-legend
+      changed_when: false
+      failed_when: false   # non-fatal here; this is a baseline capture, not a hard blocker
+      register: _failed_units
+
+    - name: Check whether a reboot is already pending before this patch cycle
+      ansible.builtin.command: needs-restarting -r
+      changed_when: false
+      failed_when: _needs_restarting_pre.rc not in [0, 1]
+      register: _needs_restarting_pre
+
+    - name: Build the list of hard-blocking findings
+      ansible.builtin.set_fact:
+        _hard_blockers: "{{ (_disk_findings | default([])) + ((_check_update.rc == 1) | ternary(['dnf check-update failed (rc=1): repo unreachable or metadata error -- see dnf_check_update_output in this report'], [])) }}"
+
+    - name: Assemble precheck_data
+      ansible.builtin.set_fact:
+        precheck_data: "{{ patch_collected_facts | combine({
+            'change_id': change_id,
+            'stage': 'precheck',
+            'status': (_hard_blockers | length > 0) | ternary('failed', 'success'),
+            'hard_blockers': _hard_blockers,
+            'reboot_pending_before_patch': (_needs_restarting_pre.rc == 1),
+            'failed_systemd_units_baseline': (_failed_units.stdout_lines | map('trim') | list),
+            'subscription_status': {
+              'rc': _sub_status.rc,
+              'output': _sub_status.stdout_lines | default([])
+            },
+            'dnf_check_update_output': _check_update.stdout_lines | default([])
+          }) }}"
+
+    - name: Write precheck.json
+      ansible.builtin.include_role:
+        name: patch_common
+        tasks_from: state_write
+      vars:
+        state_filename: precheck.json
+        state_data: "{{ precheck_data }}"
+
+  rescue:
+
+    - name: Record that pre-check errored unexpectedly (best-effort; may run before facts were collected)
+      ansible.builtin.set_fact:
+        precheck_data: "{{ (patch_collected_facts | default({})) | combine({
+            'change_id': change_id,
+            'stage': 'precheck',
+            'status': 'failed',
+            'error': ansible_failed_result.msg | default('pre-check task failed'),
+          }) }}"
+
+    - name: Write precheck.json for the failed run (best-effort)
+      ansible.builtin.include_role:
+        name: patch_common
+        tasks_from: state_write
+      vars:
+        state_filename: precheck.json
+        state_data: "{{ precheck_data }}"
+      ignore_errors: true
+
+    - name: Re-raise the failure so this host is marked failed in the job summary
+      ansible.builtin.fail:
+        msg: "{{ ansible_failed_result.msg | default('Pre-check failed for ' ~ inventory_hostname) }}"
+
+# Deliberately OUTSIDE the block/rescue above: precheck.json (with full
+# hard_blockers detail) is already written by the time this runs. Failing
+# here instead of inside the block means this expected, business-logic
+# failure doesn't get caught by the SAME rescue meant for genuine
+# unexpected errors -- which would otherwise overwrite the just-written,
+# detailed precheck.json with a bare {status: failed, error: <msg>} record
+# (reproduced locally: the rich hard_blockers detail was silently lost on
+# every hard-blocker failure until this was split out).
+- name: Fail this host if any hard blocker was found (batch continues per max_fail_percentage)
+  ansible.builtin.fail:
+    msg: "Pre-check failed for {{ inventory_hostname }}: {{ _hard_blockers | join('; ') }}"
+  when: _hard_blockers | default([]) | length > 0

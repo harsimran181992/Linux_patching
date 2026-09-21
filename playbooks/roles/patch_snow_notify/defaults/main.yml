@@ -1,0 +1,10 @@
+---
+snow_notify_enabled: false
+snow_instance_url: ""
+snow_change_table: "change_request"
+snow_auth_type: basic     # basic | oauth
+snow_username: ""
+snow_password: ""
+snow_oauth_token: ""
+snow_validate_certs: true
+snow_request_timeout: 30

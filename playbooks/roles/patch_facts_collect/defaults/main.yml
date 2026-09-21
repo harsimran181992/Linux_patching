@@ -1,0 +1,8 @@
+---
+# Defaults for patch_facts_collect. Actual values normally come from
+# group_vars/all.yml; repeated here only as a safety net if the role is
+# ever run standalone.
+patch_sysctl_allowlist:
+  - net.ipv4.ip_forward
+  - kernel.randomize_va_space
+  - vm.swappiness

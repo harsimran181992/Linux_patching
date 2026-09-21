@@ -1,0 +1,318 @@
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# patch_facts_collect
+#
+# Single source of truth for "what do we capture about a host". Called
+# identically by patch_precheck (to build the baseline) and patch_postcheck
+# (to build the comparison snapshot) so the two can never drift apart.
+#
+# Every module/command below was verified against the installed ansible-core
+# 2.19 source/docs before use (see patching/README.md "Grounding notes").
+# Two gotchas are handled explicitly rather than assumed away:
+#   - ansible_facts.services requires the dedicated service_facts module;
+#     it is NOT produced by setup's gather_subset.
+#   - ansible_facts.selinux.status can be the literal string
+#     "Missing selinux Python library" when python3-libselinux isn't
+#     installed on the target -- falls back to `getenforce`.
+#
+# Output: sets `patch_collected_facts`, a single structured dict split into
+# `static` (expected identical pre/post -- any diff is a drift finding) and
+# `changed` (expected to differ -- proves patching happened).
+# ─────────────────────────────────────────────────────────────────────────────
+
+- name: Gather standard Ansible facts (hardware, network, virtual, etc.)
+  ansible.builtin.setup:
+
+- name: Gather service facts (enabled/disabled/state per unit)
+  ansible.builtin.service_facts:
+
+- name: Gather installed package facts (name -> version/release/epoch/arch)
+  ansible.builtin.package_facts:
+    manager: rpm
+
+# ── Items with no ansible_facts equivalent: raw command capture ────────────
+- name: Capture memory block topology (lsmem)
+  ansible.builtin.command: lsmem
+  changed_when: false
+  register: _lsmem
+
+- name: Capture swap device configuration (swapon --show)
+  ansible.builtin.command: swapon --show
+  changed_when: false
+  failed_when: false   # empty output/non-zero when no swap is configured -- not an error
+  register: _swapon
+
+- name: Capture block device UUID/LABEL/TYPE for all block devices (blkid -o export)
+  ansible.builtin.command: blkid -o export
+  changed_when: false
+  failed_when: _blkid.rc not in [0, 2]   # blkid rc=2 means "no devices found", not a failure here
+  register: _blkid
+
+- name: Capture the routing table (ip route show)
+  ansible.builtin.command: ip route show
+  changed_when: false
+  register: _ip_route
+
+- name: Capture NTP/time-sync configuration (timedatectl show)
+  ansible.builtin.command: timedatectl show
+  changed_when: false
+  failed_when: false   # informational tier; don't hard-fail the whole host on this alone
+  register: _timedatectl
+
+- name: Capture enabled package repositories (dnf repolist -v)
+  ansible.builtin.command: dnf repolist -v
+  changed_when: false
+  failed_when: false   # informational tier; dnf check-update (in patch_precheck) is the real repo-health gate
+  register: _repolist
+
+- name: Capture curated sysctl values
+  ansible.builtin.command: "sysctl {{ patch_sysctl_allowlist | join(' ') }}"
+  changed_when: false
+  failed_when: false   # a key absent on this kernel build shouldn't fail the whole check
+  register: _sysctl
+
+- name: Checksum /etc/hosts
+  ansible.builtin.stat:
+    path: /etc/hosts
+    follow: true
+  register: _hosts_stat
+
+- name: Checksum /etc/fstab
+  ansible.builtin.stat:
+    path: /etc/fstab
+    follow: true
+  register: _fstab_stat
+
+- name: Checksum /etc/resolv.conf (follow symlink -- systemd-resolved uses one)
+  ansible.builtin.stat:
+    path: /etc/resolv.conf
+    follow: true
+  register: _resolvconf_stat
+
+# ── SELinux: prefer facts, fall back to getenforce if python bindings absent ─
+- name: Fall back to getenforce when SELinux python bindings are missing on the target
+  ansible.builtin.command: getenforce
+  changed_when: false
+  register: _getenforce
+  when: >-
+    ansible_facts.selinux.status is not defined
+    or ansible_facts.selinux.status == 'Missing selinux Python library'
+
+- name: Set SELinux status from facts (python bindings available)
+  ansible.builtin.set_fact:
+    _selinux_status: "{{ ansible_facts.selinux.status }}"
+  when: >-
+    ansible_facts.selinux.status is defined
+    and ansible_facts.selinux.status != 'Missing selinux Python library'
+
+- name: Set SELinux status from getenforce fallback
+  ansible.builtin.set_fact:
+    _selinux_status: "{{ _getenforce.stdout | trim | lower }}"
+  when: >-
+    ansible_facts.selinux.status is not defined
+    or ansible_facts.selinux.status == 'Missing selinux Python library'
+
+# ── Build a trimmed mount list: drop size_total/size_available, which churn
+#    constantly with normal disk usage and would produce a false diff every
+#    single patch cycle even though the mount CONFIGURATION didn't change. ──
+- name: Build trimmed mount list (config identity only, no live usage figures)
+  ansible.builtin.set_fact:
+    _mounts_trimmed: "{{ (_mounts_trimmed | default([])) + [{'mount': item.mount, 'device': item.device, 'fstype': item.fstype, 'options': item.options, 'uuid': item.uuid | default('')}] }}"
+  loop: "{{ ansible_facts.mounts }}"
+  loop_control:
+    label: "{{ item.mount }}"
+
+# ── Same reasoning as the mount trim above: ansible_facts.lvm.{vgs,pvs,lvs}
+#    entries include live capacity figures (size_g/free_g) that drift with
+#    normal disk usage. Keep structural identity (which PV/VG/LV exists and
+#    how they relate) and drop the capacity figures so ordinary disk usage
+#    doesn't produce a false "critical" LVM drift finding every cycle.
+#    ansible_facts.lvm is the literal string 'N/A' (not a dict) when not
+#    root or lvm2 isn't installed -- guarded by `is mapping` throughout.
+- name: Trim VG entries (drop size_g/free_g, keep num_lvs/num_pvs)
+  ansible.builtin.set_fact:
+    _lvm_vgs_trimmed: "{{ (_lvm_vgs_trimmed | default({})) | combine({item.key: {'num_lvs': item.value.num_lvs, 'num_pvs': item.value.num_pvs}}) }}"
+  loop: "{{ ansible_facts.lvm.vgs | dict2items }}"
+  when: ansible_facts.lvm is mapping
+  loop_control:
+    label: "{{ item.key }}"
+
+- name: Trim LV entries (drop size_g, keep vg)
+  ansible.builtin.set_fact:
+    _lvm_lvs_trimmed: "{{ (_lvm_lvs_trimmed | default({})) | combine({item.key: {'vg': item.value.vg}}) }}"
+  loop: "{{ ansible_facts.lvm.lvs | dict2items }}"
+  when: ansible_facts.lvm is mapping
+  loop_control:
+    label: "{{ item.key }}"
+
+- name: Trim PV entries (drop size_g/free_g, keep vg)
+  ansible.builtin.set_fact:
+    _lvm_pvs_trimmed: "{{ (_lvm_pvs_trimmed | default({})) | combine({item.key: {'vg': item.value.vg}}) }}"
+  loop: "{{ ansible_facts.lvm.pvs | dict2items }}"
+  when: ansible_facts.lvm is mapping
+  loop_control:
+    label: "{{ item.key }}"
+
+# ── Parse `blkid -o export`'s multi-line, blank-line-separated output into
+#    a dict keyed by device, instead of comparing the raw text as-is.
+#    Real-world evidence (a production RHEL host) showed blkid's device
+#    enumeration order is NOT stable between two separate invocations even
+#    with zero actual device changes -- comparing the raw lines produced a
+#    false "critical" drift finding every cycle, the same class of bug as
+#    the mounts-ordering fix above (just not caught earlier: this dev
+#    sandbox's blkid returns nothing to iterate over).
+#    Pass 1 tracks, for each output line, which device (the most recent
+#    preceding DEVNAME= line) it belongs to.
+- name: Track which device each blkid output line belongs to
+  ansible.builtin.set_fact:
+    _blkid_current_device: "{{ item.split('=', 1)[1] if item.startswith('DEVNAME=') else (_blkid_current_device | default('')) }}"
+    _blkid_line_devices: "{{ (_blkid_line_devices | default([])) + [item.split('=', 1)[1] if item.startswith('DEVNAME=') else (_blkid_current_device | default(''))] }}"
+  loop: "{{ _blkid.stdout_lines | default([]) }}"
+  loop_control:
+    label: "{{ item }}"
+
+# Pass 2: zip the lines back up with their tracked device and build
+# {device: {key: value}}, skipping blank lines and the DEVNAME= line itself
+# (the device is already the dict key).
+- name: Build the blkid dict keyed by device (order-independent)
+  ansible.builtin.set_fact:
+    _blkid_parsed: "{{ (_blkid_parsed | default({})) | combine({item.1: ((_blkid_parsed[item.1] | default({})) | combine({item.0.split('=', 1)[0]: item.0.split('=', 1)[1]}))}) }}"
+  loop: "{{ _blkid.stdout_lines | default([]) | zip(_blkid_line_devices | default([])) | list }}"
+  when:
+    - item.0 != ''
+    - not item.0.startswith('DEVNAME=')
+    - item.1 != ''
+  loop_control:
+    label: "{{ item.1 }}: {{ item.0 }}"
+
+# ── Optical/CD-ROM drives (sr*) report size/sectors/sectorsize that vary
+#    with whatever media is currently attached (or none) -- that's live
+#    hypervisor/media state, not host configuration. Real-world evidence: a
+#    VMware virtual CD-ROM (sr0) went from 628KB/2048B-sectors to
+#    1024MB/512B-sectors between pre-check and post-check with no actual
+#    config change, producing a false "critical" disk drift finding.
+#    Excluded by the universal Linux SCSI CD-ROM naming convention rather
+#    than chasing hypervisor-specific vendor/model strings.
+- name: Build the disk device dict, excluding optical/CD-ROM drives (sr*)
+  ansible.builtin.set_fact:
+    _devices_trimmed: "{{ (ansible_facts.devices | default({})) | dict2items | rejectattr('key', 'match', '^sr[0-9]+$') | items2dict }}"
+
+# ── Pull each interface's own top-level fact dict (ansible_facts.<ifname>)
+#    into one nested structure for our state file. Bracket-notation lookup
+#    so interface names containing '.', '-', '@' etc. (VLANs, bridges,
+#    macvlans) don't break dotted-attribute access. ─────────────────────────
+- name: Build per-interface network snapshot
+  ansible.builtin.set_fact:
+    _per_interface: "{{ (_per_interface | default({})) | combine({item: {'ipv4': ansible_facts[item].ipv4 | default({}), 'ipv6': ansible_facts[item].ipv6 | default([]), 'macaddress': ansible_facts[item].macaddress | default(''), 'mtu': ansible_facts[item].mtu | default(0), 'type': ansible_facts[item].type | default('')}}) }}"
+  loop: "{{ ansible_facts.interfaces | default([]) | sort }}"
+
+# ── Parse the curated sysctl output into a {key: value} dict. Parsed from
+#    the "key = value" output lines directly (not zipped positionally
+#    against the allowlist) so a key that's absent on this kernel build is
+#    simply missing from the dict instead of desyncing the pairing. ────────
+- name: Parse curated sysctl output into a dict
+  ansible.builtin.set_fact:
+    _sysctl_values: "{{ (_sysctl_values | default({})) | combine({(item.split('=')[0] | trim): (item.split('=')[1] | trim)}) }}"
+  loop: "{{ _sysctl.stdout_lines | default([]) }}"
+  when: "'=' in item"
+  loop_control:
+    label: "{{ item.split('=')[0] | trim if '=' in item else item }}"
+
+# ── Assemble everything into one structured dict ────────────────────────────
+- name: Assemble collected facts into one structured dict
+  ansible.builtin.set_fact:
+    patch_collected_facts:
+      collected_at: "{{ ansible_date_time.iso8601 }}"
+
+      static:
+        hostname:
+          hostname: "{{ ansible_facts.hostname }}"
+          fqdn: "{{ ansible_facts.fqdn }}"
+          domain: "{{ ansible_facts.domain | default('') }}"
+
+        cpu:
+          architecture: "{{ ansible_facts.architecture }}"
+          processor_count: "{{ ansible_facts.processor_count }}"
+          processor_cores: "{{ ansible_facts.processor_cores }}"
+          processor_vcpus: "{{ ansible_facts.processor_vcpus | default('') }}"
+
+        memory:
+          memtotal_mb: "{{ ansible_facts.memtotal_mb }}"
+          lsmem_raw: "{{ _lsmem.stdout_lines }}"
+
+        swap:
+          swaptotal_mb: "{{ ansible_facts.swaptotal_mb }}"
+          swapon_raw: "{{ _swapon.stdout_lines | default([]) }}"
+
+        filesystems:
+          # sort(attribute='mount'): ansible_facts.mounts gathers per-mount
+          # extra info (size/uuid) via a ThreadPoolExecutor, so its list
+          # ORDER is not guaranteed stable between two separate runs even
+          # when the actual mount set is unchanged -- reproduced in local
+          # testing (two consecutive runs on an idle host, same 6 mounts,
+          # 2 swapped positions -> a naive list != would have flagged a
+          # false "critical" drift on every single patch cycle).
+          mounts: "{{ _mounts_trimmed | default([]) | sort(attribute='mount') }}"
+
+        disks:
+          devices: "{{ _devices_trimmed | default({}) }}"
+
+        blkid:
+          devices: "{{ _blkid_parsed | default({}) }}"
+
+        lvm:
+          lvm_facts: "{{ {'vgs': _lvm_vgs_trimmed | default({}), 'lvs': _lvm_lvs_trimmed | default({}), 'pvs': _lvm_pvs_trimmed | default({})} if (ansible_facts.lvm is defined and ansible_facts.lvm is mapping) else 'N/A' }}"
+
+        network:
+          interfaces: "{{ ansible_facts.interfaces | default([]) | sort }}"
+          per_interface: "{{ _per_interface | default({}) }}"
+
+        routes:
+          raw: "{{ _ip_route.stdout_lines }}"
+
+        dns:
+          resolv_conf_checksum: "{{ _resolvconf_stat.stat.checksum | default('') }}"
+
+        hosts_file:
+          checksum: "{{ _hosts_stat.stat.checksum | default('') }}"
+
+        ntp:
+          timedatectl_raw: "{{ _timedatectl.stdout_lines }}"
+
+        services:
+          # `state` (running/stopped/failed/unknown) rather than `status`
+          # (enabled/disabled/static/...): we care whether a service is
+          # actually UP, not just whether its unit file is set to start on
+          # boot -- a service can be "enabled" and still be crashed, which
+          # "enabled" alone would never catch as a regression. The
+          # service_facts RETURN doc marks `state` "returned: always"
+          # (unlike `status`, which isn't returned for every entry), but
+          # selectattr('state', 'defined') is kept anyway for the same
+          # defensive reason as the old enabled-based check.
+          running: "{{ ansible_facts.services.values() | selectattr('state', 'defined') | selectattr('state', 'equalto', 'running') | map(attribute='name') | sort | list }}"
+
+        selinux:
+          status: "{{ _selinux_status | default('unknown') }}"
+          mode: "{{ ansible_facts.selinux.mode | default('unknown') }}"
+          type: "{{ ansible_facts.selinux.type | default('unknown') }}"
+          policyvers: "{{ ansible_facts.selinux.policyvers | default('unknown') }}"
+          config_mode: "{{ ansible_facts.selinux.config_mode | default('unknown') }}"
+
+        fstab:
+          checksum: "{{ _fstab_stat.stat.checksum | default('') }}"
+
+        sysctl:
+          values: "{{ _sysctl_values | default({}) }}"
+
+        repos:
+          raw: "{{ _repolist.stdout_lines }}"
+
+      changed:
+        kernel: "{{ ansible_facts.kernel }}"
+        os_version:
+          distribution: "{{ ansible_facts.distribution }}"
+          distribution_version: "{{ ansible_facts.distribution_version }}"
+          distribution_release: "{{ ansible_facts.distribution_release | default('') }}"
+          distribution_major_version: "{{ ansible_facts.distribution_major_version }}"
+        uptime_seconds: "{{ ansible_facts.uptime_seconds | default(-1) }}"
+        packages: "{{ ansible_facts.packages | default({}) }}"

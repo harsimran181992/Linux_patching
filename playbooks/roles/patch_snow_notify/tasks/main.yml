@@ -1,0 +1,51 @@
+---
+# See README.md -- this is a stub pending real ServiceNow instance details
+# (table name, field names, auth mechanism). Runs on localhost (the AAP
+# controller side), called once per run with the full snow_payload list.
+#
+# Input: snow_payload (list of per-host summary dicts, set by
+# patch_postcheck's aggregation task).
+
+- name: Log the summary that would be sent to ServiceNow (notify disabled)
+  ansible.builtin.debug:
+    msg: "snow_notify_enabled is false -- not pushing to ServiceNow. Payload: {{ snow_payload }}"
+  when: not snow_notify_enabled
+
+- name: Resolve the Change Request sys_id from its number
+  ansible.builtin.uri:
+    url: "{{ snow_instance_url }}/api/now/table/{{ snow_change_table }}?sysparm_query=number={{ change_id }}&sysparm_fields=sys_id&sysparm_limit=1"
+    method: GET
+    url_username: "{{ snow_username if snow_auth_type == 'basic' else omit }}"
+    url_password: "{{ snow_password if snow_auth_type == 'basic' else omit }}"
+    force_basic_auth: "{{ true if snow_auth_type == 'basic' else omit }}"
+    headers: "{{ {'Authorization': 'Bearer ' ~ snow_oauth_token} if snow_auth_type == 'oauth' else {} }}"
+    validate_certs: "{{ snow_validate_certs }}"
+    timeout: "{{ snow_request_timeout }}"
+    status_code: [200]
+  register: _snow_lookup
+  when: snow_notify_enabled
+
+- name: Fail clearly if the change record wasn't found in ServiceNow
+  ansible.builtin.fail:
+    msg: "No {{ snow_change_table }} record found in ServiceNow with number={{ change_id }}"
+  when:
+    - snow_notify_enabled
+    - (_snow_lookup.json.result | default([])) | length == 0
+
+- name: Push the post-check summary into the change record's work notes
+  ansible.builtin.uri:
+    url: "{{ snow_instance_url }}/api/now/table/{{ snow_change_table }}/{{ _snow_lookup.json.result[0].sys_id }}"
+    method: PATCH
+    url_username: "{{ snow_username if snow_auth_type == 'basic' else omit }}"
+    url_password: "{{ snow_password if snow_auth_type == 'basic' else omit }}"
+    force_basic_auth: "{{ true if snow_auth_type == 'basic' else omit }}"
+    headers: "{{ {'Authorization': 'Bearer ' ~ snow_oauth_token} if snow_auth_type == 'oauth' else {} }}"
+    body_format: json
+    body:
+      work_notes: "Patch cycle {{ change_id }} post-check summary:\n{% for h in snow_payload %}{{ h.hostname }}: {{ h.postcheck_status }} (kernel {{ h.kernel_before }} -> {{ h.kernel_after }}, new failed units: {{ h.new_failed_units | length }})\n{% endfor %}"
+    validate_certs: "{{ snow_validate_certs }}"
+    timeout: "{{ snow_request_timeout }}"
+    status_code: [200]
+  when:
+    - snow_notify_enabled
+    - (_snow_lookup.json.result | default([])) | length > 0

@@ -1,0 +1,54 @@
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# Runs on `localhost` at the start of every playbook (precheck/patch/
+# postcheck). ServiceNow launches the job template with extra_vars:
+#   change_id: "CHG0012345"
+#   target_hosts:
+#     - {hostname: "web01.example.com", ip: "10.1.2.3"}
+#     - {hostname: "web02.example.com", ip: "10.1.2.4"}
+# (named `target_hosts`, not `hosts` -- `hosts` is an Ansible-reserved name
+# and using it as a plain variable is flagged/unsafe, confirmed via
+# `ansible-playbook --syntax-check`: "Found variable using reserved name
+# 'hosts'".)
+# This turns that list into an in-memory `dynamic_targets` inventory group
+# for the rest of the run. The job template's own Machine credential still
+# applies (credentials attach per-job, not per-inventory-host), so SSH to
+# these ad-hoc hosts works without them ever being in a static inventory.
+# ─────────────────────────────────────────────────────────────────────────────
+
+- name: Assert required extra_vars are present
+  ansible.builtin.assert:
+    that:
+      - change_id is defined
+      - change_id | string | length > 0
+      - target_hosts is defined
+      - target_hosts | length > 0
+    fail_msg: >-
+      This job template requires 'change_id' (the ServiceNow Change/Task
+      number) and 'target_hosts' (a list of {hostname, ip} objects) as
+      extra_vars. Got change_id={{ change_id | default('<undefined>') }},
+      target_hosts count={{ (target_hosts | default([])) | length }}.
+    quiet: true
+
+- name: Assert every host entry has hostname and ip
+  ansible.builtin.assert:
+    that:
+      - item.hostname is defined
+      - item.hostname | length > 0
+      - item.ip is defined
+      - item.ip | length > 0
+    fail_msg: "Malformed host entry from ServiceNow: {{ item }}"
+    quiet: true
+  loop: "{{ target_hosts }}"
+  loop_control:
+    label: "{{ item.hostname | default('?') }}"
+
+- name: Add ServiceNow-supplied hosts to the dynamic_targets group
+  ansible.builtin.add_host:
+    name: "{{ item.hostname }}"
+    groups: dynamic_targets
+    ansible_host: "{{ item.ip }}"
+    snow_change_id: "{{ change_id }}"
+  loop: "{{ target_hosts }}"
+  loop_control:
+    label: "{{ item.hostname }}"

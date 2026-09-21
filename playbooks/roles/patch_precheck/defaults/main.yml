@@ -1,0 +1,5 @@
+---
+min_free_space_mb:
+  root: 1024
+  boot: 200
+  var: 2048

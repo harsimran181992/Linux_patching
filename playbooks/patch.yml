@@ -1,0 +1,60 @@
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# Playbook : patch.yml
+# Purpose  : RHEL 8/9 patch apply. Safety-gated on a successful precheck.json
+#            for this exact change_id existing on each host (a host with no
+#            recorded pre-check for this cycle is never silently patched).
+#            Applies updates via dnf (dispatched by patch_pkg_manager, so a
+#            future RHEL10/dnf5 addition only needs a new pkg_mgr task file),
+#            reboots if required/policy/maintenance-window allow, and writes
+#            patch_summary.json for postcheck.yml to read back.
+#
+# Trigger  : Launched by ServiceNow at the patch-window-start stage.
+#
+# extra_vars contract (required on every launch):
+#   change_id: "CHG0012345"
+#   target_hosts:
+#     - {hostname: "web01.example.com", ip: "10.1.2.3"}
+#   # optional overrides: patch_packages, patch_exclude, patch_security_only,
+#   # patch_bugfix_only, reboot_policy, maintenance_window
+#
+# Standalone usage:
+#   ansible-playbook playbooks/patch.yml \
+#     -e change_id=CHG0012345 \
+#     -e '{"target_hosts":[{"hostname":"web01.example.com","ip":"10.1.2.3"}]}'
+# ─────────────────────────────────────────────────────────────────────────────
+
+- name: Bootstrap dynamic targets from the ServiceNow host list
+  hosts: localhost
+  gather_facts: false
+  connection: local
+  tasks:
+    - name: Turn extra_vars.target_hosts into the dynamic_targets inventory group
+      ansible.builtin.include_role:
+        name: patch_common
+        tasks_from: bootstrap_targets
+
+- name: Apply patches to every target host
+  hosts: dynamic_targets
+  become: true
+  gather_facts: true
+  # See precheck.yml for why these reference hostvars['localhost'] rather
+  # than a bare "{{ var }}" (max_fail_percentage fails to template directly
+  # against a runtime-created group -- reproduced against ansible-core 2.19).
+  serial: "{{ hostvars['localhost'].patch_batch_serial }}"
+  max_fail_percentage: "{{ hostvars['localhost'].patch_max_fail_percentage }}"
+  any_errors_fatal: false
+  tasks:
+    - name: Detect OS and load per-version group_vars (RHEL 8/9 gate)
+      ansible.builtin.include_role:
+        name: patch_common
+        tasks_from: assign_os_group
+
+    - name: Ensure the per-change state directory exists
+      ansible.builtin.include_role:
+        name: patch_common
+        tasks_from: ensure_state_dir
+
+    - name: Apply patches
+      ansible.builtin.include_role:
+        name: patch_apply

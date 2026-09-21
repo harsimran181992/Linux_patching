@@ -1,0 +1,87 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Global defaults for the RHEL 8/9 patching automation.
+# Override any of these via AAP survey / extra_vars on a per-launch basis.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── Correlation ──────────────────────────────────────────────────────────────
+# Every one of the 3 job templates (precheck / patch / postcheck) MUST be
+# launched with a change_id (the ServiceNow Change Request / Task number,
+# e.g. "CHG0012345"). It is the key that ties the three independent runs
+# together and namespaces the on-host state directory.
+# change_id: ""   # intentionally left undefined -- patch_common asserts on it
+
+# State kept on each managed host across the 3 independent runs.
+patch_state_root: /var/log/patch_mgmt
+patch_state_dir_mode: "0750"
+patch_state_file_mode: "0640"
+
+# ── Patch scope ──────────────────────────────────────────────────────────────
+patch_packages: "*"          # "*" = all available updates (agreed default)
+patch_exclude: []            # list of package names/globs to exclude
+patch_security_only: false   # true -> dnf security:true (CVE/errata only)
+patch_bugfix_only: false     # true -> dnf bugfix:true
+# When both are false (the default), a full "state=latest" update is run.
+
+# ── Reboot policy ────────────────────────────────────────────────────────────
+# Chosen policy: auto-reboot if needs-restarting flags one, but only inside
+# the maintenance window (if one is configured).
+reboot_policy: auto          # auto | never
+reboot_timeout: 900          # seconds to wait for the host to come back
+reboot_pre_delay: 5
+reboot_post_delay: 30
+
+# Empty = unrestricted (reboot immediately when required).
+# Format: 24h "HH:MM", same-day window only.
+maintenance_window: {}
+# maintenance_window:
+#   start: "22:00"
+#   end:   "02:00"
+
+# ── Batching / failure isolation ─────────────────────────────────────────────
+# Chosen policy: isolate a failing host and continue the rest of the batch.
+patch_batch_serial: "20%"
+patch_max_fail_percentage: 100   # 100 = never abort the whole batch
+
+# ── Pre-check thresholds ─────────────────────────────────────────────────────
+min_free_space_mb:
+  root: 1024
+  boot: 200
+  var: 2048
+
+# ── Kernel parameters worth tracking (sysctl -a dumps 800+ mostly-noise
+#    lines; keep this list curated rather than diffing everything). ──────────
+patch_sysctl_allowlist:
+  - net.ipv4.ip_forward
+  - net.ipv6.conf.all.forwarding
+  - kernel.randomize_va_space
+  - vm.swappiness
+  - fs.file-max
+  - net.core.somaxconn
+  - kernel.panic_on_oops
+
+# ── Static-check severity tiers ──────────────────────────────────────────────
+# A static item is NOT expected to change across a patch cycle. If it does,
+# it's flagged at the tier below rather than a single pass/fail. Only
+# `critical` findings fail the host (see patch_postcheck's status logic) --
+# `warning`/`informational` are always reported (full field-level detail in
+# comparison.json, and warning-tier also surfaces in the compact
+# ServiceNow-facing summary's warning_findings list) but never block.
+#
+# disks/blkid are deliberately `warning`, not `critical`: both can change
+# for entirely benign reasons outside our control -- device enumeration
+# order isn't guaranteed stable across a reboot (SAN/multipath/some
+# hypervisors), and optical/media state is host-external -- confirmed
+# against a real production host. Real disk/device problems still get
+# reported, just don't fail the run on their own.
+patch_check_severity:
+  critical: [hostname, filesystems, lvm, network, routes, fstab]
+  warning: [selinux, services, dns, ntp, disks, blkid]
+  informational: [cpu, memory, swap, repos, sysctl, hosts_file]
+
+# ── ServiceNow notification (patch_snow_notify role) ─────────────────────────
+# Fill these in once the real SNOW instance/table/field names are known.
+# See playbooks/roles/patch_snow_notify/README.md for the exact contract.
+snow_notify_enabled: false
+snow_instance_url: ""            # e.g. https://yourinstance.service-now.com
+snow_change_table: "change_request"
+snow_auth_type: basic            # basic | oauth

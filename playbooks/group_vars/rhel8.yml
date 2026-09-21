@@ -1,0 +1,6 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# RHEL 8 specific overrides.
+# Applied by patch_common after OS detection (group name: rhel8).
+# ─────────────────────────────────────────────────────────────────────────────
+patch_pkg_manager: dnf     # dispatches playbooks/roles/patch_apply/tasks/pkg_mgr/dnf.yml
+patch_needs_restarting_pkg: dnf-utils

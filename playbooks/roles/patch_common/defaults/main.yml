@@ -1,0 +1,4 @@
+---
+patch_state_root: /var/log/patch_mgmt
+patch_state_dir_mode: "0750"
+patch_state_file_mode: "0640"

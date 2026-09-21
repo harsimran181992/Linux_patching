@@ -1,0 +1,20 @@
+---
+# Creates /var/log/patch_mgmt/<change_id>/ on the managed host -- the
+# durable, per-cycle handoff point between the 3 independently-launched
+# job templates (see patching/README.md "State handoff" for why this lives
+# on the managed host rather than the controller).
+- name: Assert change_id is set
+  ansible.builtin.assert:
+    that:
+      - change_id is defined
+      - change_id | string | length > 0
+    fail_msg: "change_id extra_var is required."
+    quiet: true
+
+- name: Ensure per-change state directory exists
+  ansible.builtin.file:
+    path: "{{ patch_state_root }}/{{ change_id }}"
+    state: directory
+    mode: "{{ patch_state_dir_mode }}"
+    owner: root
+    group: root

@@ -1,0 +1,17 @@
+---
+# patch_common has no single default entrypoint -- its task files run in
+# different host contexts within the same playbook (bootstrap_targets on
+# localhost, the rest on the dynamically-added managed hosts) so each
+# playbook includes the specific file it needs via `tasks_from:`. See:
+#   tasks/bootstrap_targets.yml  -- localhost play: turn extra_vars.hosts
+#                                    into the dynamic_targets group
+#   tasks/assign_os_group.yml    -- managed-host play: RHEL 8/9 gate +
+#                                    group_by so playbooks/group_vars/rhelN.yml loads
+#   tasks/ensure_state_dir.yml   -- managed-host play: create the per-change
+#                                    state directory
+#   tasks/state_write.yml        -- include with state_filename/state_data
+#   tasks/state_read.yml         -- include with state_filename/state_result_var
+- name: (no-op) patch_common has no default entrypoint, see comments above
+  ansible.builtin.debug:
+    msg: "patch_common: include a specific tasks_from, not this main.yml"
+    verbosity: 3

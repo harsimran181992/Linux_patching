@@ -1,0 +1,159 @@
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# patch_apply
+#
+# Runs once per host (called from playbooks/patch.yml, independently of
+# precheck.yml -- possibly hours/days later). Safety-gated on a successful
+# precheck.json for this exact change_id existing on this host: a host with
+# no recorded pre-check for this cycle is never silently patched.
+# ─────────────────────────────────────────────────────────────────────────────
+
+- name: Run and record patch apply for this host
+  block:
+
+    - name: Read precheck.json (safety gate -- required)
+      ansible.builtin.include_role:
+        name: patch_common
+        tasks_from: state_read
+      vars:
+        state_filename: precheck.json
+        state_result_var: _precheck_data
+        state_required: true
+
+    - name: Refuse to patch if the recorded pre-check for this change did not pass
+      ansible.builtin.fail:
+        msg: >-
+          precheck.json for change {{ change_id }} on {{ inventory_hostname }}
+          has status='{{ _precheck_data.status | default('unknown') }}', not
+          'success'. Re-run pre-check and resolve its findings before patching.
+      when: _precheck_data.status | default('unknown') != 'success'
+
+    - name: Snapshot installed package versions before patching
+      ansible.builtin.package_facts:
+        manager: rpm
+
+    - name: Store the before-patch package snapshot
+      ansible.builtin.set_fact:
+        _packages_before: "{{ ansible_facts.packages }}"
+
+    - name: Determine current local time on the managed host (HH:MM)
+      ansible.builtin.set_fact:
+        _now_hhmm: "{{ '%02d' | format(ansible_date_time.hour | int) }}:{{ '%02d' | format(ansible_date_time.minute | int) }}"
+
+    # maintenance_window gates the REBOOT decision only (per agreed design),
+    # not whether patches get applied -- ServiceNow already controls *when*
+    # this job template is launched. Handles a window that crosses midnight
+    # (e.g. start=22:00, end=02:00) as well as a same-day window.
+    - name: Evaluate whether we're currently inside the configured maintenance window
+      ansible.builtin.set_fact:
+        _in_maintenance_window: >-
+          {{
+            true
+            if (maintenance_window is not defined or maintenance_window | length == 0)
+            else (
+              (_now_hhmm >= maintenance_window.start and _now_hhmm < maintenance_window.end)
+              if maintenance_window.start <= maintenance_window.end
+              else (_now_hhmm >= maintenance_window.start or _now_hhmm < maintenance_window.end)
+            )
+          }}
+
+    - name: Dispatch to the package-manager-specific patch task file
+      ansible.builtin.include_tasks: "pkg_mgr/{{ patch_pkg_manager }}.yml"
+
+    - name: Snapshot installed package versions after patching
+      ansible.builtin.package_facts:
+        manager: rpm
+
+    - name: Store the after-patch package snapshot
+      ansible.builtin.set_fact:
+        _packages_after: "{{ ansible_facts.packages }}"
+
+    # Diff before/after by name: compares first-listed version per name.
+    # A package can appear multiple times (different arches); the diff is
+    # intentionally name-keyed and coarse -- full before/after dicts are
+    # also stored in patch_summary.json for anyone who needs arch-level detail.
+    - name: Compute the list of packages whose version actually changed
+      ansible.builtin.set_fact:
+        _packages_changed: "{{ (_packages_changed | default([])) + [{'name': item, 'before': (_packages_before[item][0].version ~ '-' ~ _packages_before[item][0].release), 'after': (_packages_after[item][0].version ~ '-' ~ _packages_after[item][0].release)}] }}"
+      loop: "{{ _packages_after.keys() | list }}"
+      when:
+        - item in _packages_before
+        - (_packages_before[item][0].version ~ '-' ~ _packages_before[item][0].release) != (_packages_after[item][0].version ~ '-' ~ _packages_after[item][0].release)
+      loop_control:
+        label: "{{ item }}"
+
+    - name: Check whether a reboot is required after this patch run
+      ansible.builtin.command: needs-restarting -r
+      changed_when: false
+      # needs-restarting -r: rc=1 reboot required, rc=0 not required
+      # (confirmed against dnf-plugins-core documentation).
+      failed_when: _needs_restarting.rc not in [0, 1]
+      register: _needs_restarting
+
+    - name: Decide whether to reboot now
+      ansible.builtin.set_fact:
+        _reboot_required: "{{ _needs_restarting.rc == 1 }}"
+        _should_reboot_now: "{{ (_needs_restarting.rc == 1) and (reboot_policy == 'auto') and _in_maintenance_window }}"
+
+    - name: Reboot the host (required, policy=auto, inside maintenance window)
+      ansible.builtin.reboot:
+        msg: "Reboot initiated by RHEL patch automation (change {{ change_id }})"
+        reboot_timeout: "{{ reboot_timeout }}"
+        pre_reboot_delay: "{{ reboot_pre_delay }}"
+        post_reboot_delay: "{{ reboot_post_delay }}"
+      when: _should_reboot_now
+
+    - name: Assemble patch_summary_data
+      ansible.builtin.set_fact:
+        patch_summary_data:
+          change_id: "{{ change_id }}"
+          stage: patch
+          status: success
+          applied_at: "{{ ansible_date_time.iso8601 }}"
+          packages_changed: "{{ _packages_changed | default([]) }}"
+          packages_before: "{{ _packages_before }}"
+          packages_after: "{{ _packages_after }}"
+          dnf_changed: "{{ _dnf_result.changed | default(false) }}"
+          reboot_required: "{{ _reboot_required }}"
+          reboot_performed: "{{ _should_reboot_now }}"
+          reboot_deferred_reason: >-
+            {{
+              ''
+              if not _reboot_required
+              else (
+                'reboot_policy is never' if reboot_policy != 'auto'
+                else ('outside configured maintenance window' if not _in_maintenance_window else '')
+              )
+            }}
+
+    - name: Write patch_summary.json
+      ansible.builtin.include_role:
+        name: patch_common
+        tasks_from: state_write
+      vars:
+        state_filename: patch_summary.json
+        state_data: "{{ patch_summary_data }}"
+
+  rescue:
+
+    - name: Record that patching errored unexpectedly (best-effort)
+      ansible.builtin.set_fact:
+        patch_summary_data:
+          change_id: "{{ change_id }}"
+          stage: patch
+          status: failed
+          error: "{{ ansible_failed_result.msg | default('patch apply task failed') }}"
+          packages_changed: "{{ _packages_changed | default([]) }}"
+
+    - name: Write patch_summary.json for the failed run (best-effort)
+      ansible.builtin.include_role:
+        name: patch_common
+        tasks_from: state_write
+      vars:
+        state_filename: patch_summary.json
+        state_data: "{{ patch_summary_data }}"
+      ignore_errors: true
+
+    - name: Re-raise the failure so this host is marked failed in the job summary
+      ansible.builtin.fail:
+        msg: "{{ ansible_failed_result.msg | default('Patch apply failed for ' ~ inventory_hostname) }}"

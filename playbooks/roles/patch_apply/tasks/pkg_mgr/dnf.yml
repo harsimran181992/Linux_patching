@@ -1,0 +1,24 @@
+---
+# Package-manager-specific patch task file, dispatched from tasks/main.yml
+# via: include_tasks: "pkg_mgr/{{ patch_pkg_manager }}.yml"
+#
+# Kept as a separate file (rather than inline in main.yml) specifically so
+# that adding RHEL10 later is "drop in pkg_mgr/dnf5.yml + point
+# playbooks/group_vars/rhel10.yml at it" -- no changes needed here or in main.yml.
+#
+# ansible.builtin.dnf params verified via `ansible-doc ansible.builtin.dnf`
+# against the installed ansible-core 2.19: security/bugfix (bool, only
+# apply with state=latest), update_only (update installed pkgs, never
+# install new ones), lock_timeout (module already waits out the dnf lock,
+# no separate lock-check task needed).
+- name: "Apply patches via dnf, scoped to: {{ patch_packages }}"
+  ansible.builtin.dnf:
+    name: "{{ patch_packages }}"
+    exclude: "{{ patch_exclude | default(omit) }}"
+    state: latest
+    update_only: true
+    security: "{{ patch_security_only }}"
+    bugfix: "{{ patch_bugfix_only }}"
+    update_cache: true
+    lock_timeout: 60
+  register: _dnf_result
