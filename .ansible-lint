@@ -1,0 +1,38 @@
+---
+# ansible-lint config for the RHEL patching automation.
+# Every exclusion below is a deliberate choice, not a blanket suppression --
+# see the reasoning next to each.
+
+skip_list:
+  # Parameterized-include "call contract" vars (state_filename, state_data,
+  # state_result_var, state_required in patch_common's state_read.yml/
+  # state_write.yml) are intentionally NOT role-prefixed -- they're function-
+  # call-style parameter names shared identically across every caller
+  # (patch_precheck, patch_apply, patch_postcheck), and prefixing them with
+  # patch_common_ would just make every include_role call more verbose
+  # without adding clarity. Internal `_`-prefixed temp facts hit the same
+  # rule for the same reason (they're deliberately unprefixed scratch vars,
+  # local to one task file).
+  - var-naming[no-role-prefix]
+
+  # `systemctl --failed --no-legend` (list ALL failed units system-wide) has
+  # no equivalent in ansible.builtin.systemd/systemd_service, which only
+  # operates on one named unit at a time. Flagged by a command-vs-module
+  # heuristic that doesn't account for this.
+  - command-instead-of-module
+
+  # The two "best-effort state write in a rescue block" tasks
+  # (patch_precheck, patch_apply, patch_postcheck, patch_snow_notify)
+  # deliberately use ignore_errors: true -- we're already handling one
+  # failure and attempting a best-effort write of the failure record itself;
+  # if that write also fails, we still need to proceed to re-raise the
+  # ORIGINAL failure, not get stuck enumerating specific rc/conditions for
+  # a second, unrelated failure mode via failed_when.
+  - ignore-errors
+
+warn_list:
+  # Several of our own Jinja dict-assembly expressions are long by nature
+  # (structured state written to JSON) -- downgraded to non-fatal warnings
+  # rather than force-wrapped into a much harder-to-read multi-line form.
+  - yaml[line-length]
+  - jinja[spacing]
