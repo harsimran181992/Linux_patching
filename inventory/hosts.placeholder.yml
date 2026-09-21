@@ -1,0 +1,14 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Placeholder inventory.
+#
+# Real patch targets are NOT defined here. ServiceNow passes the target host
+# list (hostname + ip) as extra_vars on every job-template launch, and each
+# playbook's bootstrap play (playbooks/roles/patch_common/tasks/bootstrap_targets.yml)
+# turns that list into an in-memory `dynamic_targets` group at runtime via
+# add_host. This file only needs to exist because AAP job templates require
+# an inventory to be attached — it is never used to target real hosts.
+# ─────────────────────────────────────────────────────────────────────────────
+all:
+  hosts:
+    localhost:
+      ansible_connection: local
